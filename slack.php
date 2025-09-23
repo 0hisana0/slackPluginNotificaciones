@@ -290,15 +290,43 @@ class SlackPlugin extends Plugin {
      * @param string $colour
      * @throws \Exception
      */
-    function sendToSlack(Ticket $ticket, $heading, $body, $colour = 'good') {
+function sendToSlack(Ticket $ticket, $heading, $body, $colour = 'good') {
         global $ost, $cfg;
         if (!$ost instanceof osTicket || !$cfg instanceof OsticketConfig) {
             error_log("Slack plugin called too early.");
             return;
         }
-        $url = $this->getConfig(self::$pluginInstance)->get('slack-webhook-url');
-        if (!$url) {
-            $ost->logError('Slack Plugin not configured', 'You need to read the Readme and configure a webhook URL before using this.');
+
+        $defaultUrl = $this->getConfig(self::$pluginInstance)->get('slack-webhook-url');
+
+        $deptId = $ticket->getDeptId();
+
+        switch ($deptId) {
+            case 1:
+                // Departamento de "Support"
+                $webhookUrl = 'URL WEBHOOK';
+                break;
+
+            case 2:
+                // Departamento de "Sales"
+                $webhookUrl = 'URL WEBHOOK';
+                break;
+            
+            case 3:
+                // Departamento de "Maintenance"
+                $webhookUrl = 'URL WEBHOOK';
+                break;
+
+            default:
+                // Para cualquier otro departamento, usamos la URL general configurada en el panel.
+                $webhookUrl = $defaultUrl;
+                break;
+        }
+
+        // 4. Verificamos si, al final, tenemos una URL válida antes de continuar.
+        if (!$webhookUrl) {
+            $ost->logError('Slack Plugin not configured', 'You need to configure a default webhook URL and/or a specific URL for the department with ID: ' . $deptId);
+            return; // Detenemos la ejecución si no hay URL.
         }
 
         // Check the subject, see if we want to filter it.
@@ -351,8 +379,8 @@ class SlackPlugin extends Plugin {
         $data_string = utf8_encode(json_encode($payload));
 
         try {
-            // Setup curl
-            $ch = curl_init($url);
+            // Setup curl - ¡USAMOS NUESTRA VARIABLE $webhookUrl!
+            $ch = curl_init($webhookUrl);
             curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
             curl_setopt($ch, CURLOPT_POSTFIELDS, $data_string);
             curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -363,12 +391,12 @@ class SlackPlugin extends Plugin {
 
             // Actually send the payload to slack:
             if (curl_exec($ch) === false) {
-                throw new \Exception($url . ' - ' . curl_error($ch));
+                throw new \Exception($webhookUrl . ' - ' . curl_error($ch));
             } else {
                 $statusCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
                 if ($statusCode != '200') {
                     throw new \Exception(
-                    'Error sending to: ' . $url
+                    'Error sending to: ' . $webhookUrl
                     . ' Http code: ' . $statusCode
                     . ' curl-error: ' . curl_errno($ch));
                 }
@@ -387,6 +415,7 @@ class SlackPlugin extends Plugin {
      * @param ThreadEntry $entry        	
      * @return Ticket
      */
+
     function getTicket(ThreadEntry $entry) {
         $ticket_id = Thread::objects()->filter([
                     'id' => $entry->getThreadId()
@@ -405,6 +434,7 @@ class SlackPlugin extends Plugin {
      * @param string $text
      * @return string
      */
+
     function format_text($text) {
         $formatter      = [
             '<' => '&lt;',
@@ -433,6 +463,7 @@ class SlackPlugin extends Plugin {
      * @return String containing either just a URL or a complete image tag
      * @source https://gravatar.com/site/implement/images/php/
      */
+    
     function get_gravatar($email, $s = 80, $d = 'mm', $r = 'g', $img = false, $atts = array()) {
         $url = 'https://www.gravatar.com/avatar/';
         $url .= md5(strtolower(trim($email)));
