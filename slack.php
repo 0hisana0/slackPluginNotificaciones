@@ -41,12 +41,6 @@ class SlackPlugin extends Plugin {
   
     }
 
-    /*Caché simple para evitar duplicados (archivo temporal)
-       key: "$ticketId|$eventKey"
-       value: timestamp
-       ventana por defecto: 3 segundos*/
-
-
     private function getCacheFilePath() {
         return rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'ost_slack_notify_cache.json';
     }
@@ -82,12 +76,9 @@ class SlackPlugin extends Plugin {
         $k = $ticketId . '|' . $eventKey;
         $now = time();
         if (isset($cache[$k]) && ($now - $cache[$k]) < $window) {
-            //para notificaciones recientes
             return true;
         }
-        // registrar ahora
         $cache[$k] = $now;
-        // limpiar entradas viejas
         foreach ($cache as $ck => $ts) {
             if (($now - $ts) > ($window * 10)) {
                 unset($cache[$ck]);
@@ -97,13 +88,6 @@ class SlackPlugin extends Plugin {
         return false;
     }
 
-    /**
-     * What to do with a new Ticket?
-     * 
-     * @global OsticketConfig $cfg
-     * @param Ticket $ticket
-     * @return type
-     */
     function onTicketCreated(Ticket $ticket) {
         global $cfg;
         if (!$cfg instanceof OsticketConfig) {
@@ -111,78 +95,44 @@ class SlackPlugin extends Plugin {
             return;
         }
         
-        // if slack-update-types is "updatesOnly", then don't send this!
         if($this->getConfig(self::$pluginInstance)->get('slack-update-types') == 'updatesOnly') {return;}
 
-        // Evitar duplicados por si otro handler ya notificó
         $eventKey = 'created';
         if ($this->isRecentNotification($ticket->getId(), $eventKey)) {
             return;
         }
 
-        // Convert any HTML in the message into text
         $plaintext = Format::html2text($ticket->getMessages()[0]->getBody()->getClean());
-
-        // Format the messages we'll send.
         $heading = sprintf('%s CONTROLSTART%sscp/tickets.php?id=%d|#%sCONTROLEND %s'
                 , __("New Ticket")
                 , $cfg->getUrl()
                 , $ticket->getId()
                 , $ticket->getNumber()
                 , __("created"));
-        $this->sendToSlack($ticket, $heading, $plaintext);
+        $this->sendToSlack($ticket, $heading, $plaintext, '#000000');
     }
 
-    /**
-     * What to do with an Updated Ticket? (threadentry.created)
-     * 
-     * @global OsticketConfig $cfg
-     * @param ThreadEntry $entry
-     * @return type
-     */
     function onTicketUpdated(ThreadEntry $entry) {
         global $cfg;
 
-        if (!$cfg instanceof OsticketConfig) {
-            error_log("Plugin Slack llamado demasiado pronto.");
-            return;
-        }
+        if (!$cfg instanceof OsticketConfig) { return; }
 
-        if($this->getConfig(self::$pluginInstance)->get('slack-update-types') == 'newOnly') {
-            return;
-        }
+        if($this->getConfig(self::$pluginInstance)->get('slack-update-types') == 'newOnly') { return; }
 
-        if (!$entry instanceof ThreadEntry) {
-            return;
-        }
+        if (!$entry instanceof ThreadEntry) { return; }
 
         $ticket = $this->getTicket($entry);
-        if (!$ticket instanceof Ticket) {
-            return;
-        }
+        if (!$ticket instanceof Ticket) { return; }
 
-        // Evita duplicados: ignorar el primer mensaje (ticket nuevo)
         $first_entry = $ticket->getMessages()[0];
-        if ($entry->getId() == $first_entry->getId()) {
-            return;
-        }
+        if ($entry->getId() == $first_entry->getId()) { return; }
 
-        $type = $entry->getType();
+        if (in_array($entry->getType(), array('M','R','N'))) {
 
-        /*SOLO mensajes de usuario / respuestas / notas
-        Ignoramos los eventos del sistema (E), los maneja onObjectEdited*/
-
-
-        if (in_array($type, array('M','R','N'))) {
-
-            // Evitar duplicado por id de entry
             $eventKey = 'threadentry:' . $entry->getId();
-            if ($this->isRecentNotification($ticket->getId(), $eventKey)) {
-                return;
-            }
+            if ($this->isRecentNotification($ticket->getId(), $eventKey)) { return; }
 
             $plaintext = Format::html2text($entry->getBody()->getClean());
-
             $heading = sprintf(
                 '%s CONTROLSTART%sscp/tickets.php?id=%d|#%sCONTROLEND %s',
                 __("Ticket"),
@@ -194,245 +144,150 @@ class SlackPlugin extends Plugin {
 
             $this->sendToSlack($ticket, $heading, $plaintext, 'warning');
         }
-
     }
 
-    /**
-     * Dispara cuando se edita un objeto. La banderita de la lista usa esto.
-     * @param mixed $object  El objeto afectado (Ticket, Task, etc.)
-     * @param array $type    Info del evento, p.ej. ['type'=>'edited','key'=>'closed'|'reopened'|'status'...]
-     */
     function onObjectEdited($object, $type=array()) {
         global $cfg;
 
-        // Solo nos interesan tickets
         if (!$object instanceof Ticket) return;
         if (!$cfg instanceof OsticketConfig) return;
 
         $ticket = $object;
+        $key = isset($type['key']) ? strtolower($type['key']) : null;
 
-        // El segundo parámetro puede variar según contexto. Intentamos inferir si es edición de estado.
-        $isEditArray = is_array($type);
-        $key = null;
-        if ($isEditArray && isset($type['type']) && $type['type'] !== 'edited') {
-        }
+        if (!in_array($key, ['closed', 'reopened', 'status', 'status_id'])) return;
 
-        if ($isEditArray && isset($type['key'])) {
-            $key = strtolower($type['key']);
-        }
-
-        // Detectar cambios típicos de la banderita (status):
-        $detectedStatusChange = false;
-        if ($isEditArray && ($key === 'closed' || $key === 'reopened' || $key === 'status' || $key === 'status_id')) {
-            $detectedStatusChange = true;
-        }
-
-        // A veces 'status_id' viene directo en $type
-        if ($isEditArray && isset($type['status_id'])) {
-            $detectedStatusChange = true;
-        }
-
-        // Si no detectamos por $type: sale.
-        if (!$detectedStatusChange) {
-            return;
-        }
-
-        // Obtén el nombre del estado actual (nuevo)
         $status = $ticket->getStatus();
-        $status_name = $status ? (method_exists($status,'getName') ? $status->getName() : (isset($status['name']) ? $status['name'] : '')) : __('updated');
-        if (!$status_name) $status_name = __('updated');
-
-        // Formar una clave para dedupe basada en el ticket y estado nuevo
+        $status_name = $status ? $status->getName() : __('updated');
         $eventKey = 'status:' . $status_name;
 
-        if ($this->isRecentNotification($ticket->getId(), $eventKey)) {
-            // ya notificado recientemente
-            return;
-        }
+        if ($this->isRecentNotification($ticket->getId(), $eventKey)) { return; }
 
-        $color = '#439FE0';
-        if ($key === 'closed' || stripos($status_name, 'closed') !== false) {
-            $color = 'danger';
-        } elseif ($key === 'reopened' || stripos($status_name, 'reopen') !== false) {
-            $color = 'good';
-        } elseif ($key === 'status' || $key === 'status_id') {
+        // --- INICIO: LÓGICA PARA ELEGIR FORMATO ---
+        if ($key === 'closed' || stripos($status_name, 'closed') !== false || stripos($status_name, 'resolved') !== false) {
+            // Es un ticket cerrado, usamos la notificación especial simplificada.
+            $this->sendToSlack($ticket, '', '', 'good', 'closed');
+        } else {
+            // Es otro cambio de estado (reabierto, en progreso, etc.), usamos el formato completo.
             $color = 'warning';
+            if ($key === 'reopened' || stripos($status_name, 'reopen') !== false) {
+                $color = '#000000';
+            }
+    
+            $stateMessage = sprintf(__('status changed to %s'), $status_name);
+    
+            $heading = sprintf(
+                '%s CONTROLSTART%sscp/tickets.php?id=%d|#%sCONTROLEND %s',
+                __("Ticket"),
+                $cfg->getUrl(),
+                $ticket->getId(),
+                $ticket->getNumber(),
+                $stateMessage
+            );
+    
+            $this->sendToSlack($ticket, $heading, $ticket->getSubject(), $color);
         }
-
-        $stateMessage = sprintf(__('status changed to %s'), $status_name);
-
-        $heading = sprintf(
-            '%s CONTROLSTART%sscp/tickets.php?id=%d|#%sCONTROLEND %s',
-            __("Ticket"),
-            $cfg->getUrl(),
-            $ticket->getId(),
-            $ticket->getNumber(),
-            $stateMessage
-        );
-
-        $text = $ticket->getSubject();
-
-        //log para errores de duplicados
-        error_log(sprintf('SlackPlugin.onObjectEdited -> ticket=%d key=%s status=%s color=%s', $ticket->getId(), $key, $status_name, $color));
-
-        // Envía a Slack
-        $this->sendToSlack($ticket, $heading, $text, $color);
+        // --- FIN: LÓGICA PARA ELEGIR FORMATO ---
     }
 
-    /**
-     * A helper function that sends messages to slack endpoints. 
-     * 
-     * @global osTicket $ost
-     * @global OsticketConfig $cfg
-     * @param Ticket $ticket
-     * @param string $heading
-     * @param string $body
-     * @param string $colour
-     * @throws \Exception
-     */
-    function sendToSlack(Ticket $ticket, $heading, $body, $colour = 'good') {
+    function sendToSlack(Ticket $ticket, $heading, $body, $colour = 'good', $messageType = 'default') {
         global $ost, $cfg;
         if (!$ost instanceof osTicket || !$cfg instanceof OsticketConfig) {
             error_log("Slack plugin called too early.");
             return;
         }
-        $url = $this->getConfig(self::$pluginInstance)->get('slack-webhook-url');
-        if (!$url) {
-            $ost->logError('Slack Plugin not configured', 'You need to read the Readme and configure a webhook URL before using this.');
+
+        $deptId = $ticket->getDeptId();
+        $webhookUrl = '';
+
+        switch ($deptId) {
+            case 1: $webhookUrl = ''; break;
+            case 2: $webhookUrl = ''; break;
+            case 3: $webhookUrl = ''; break;
+            default: return;
         }
 
-        // Check the subject, see if we want to filter it.
+        if (!$webhookUrl) { return; }
+
         $regex_subject_ignore = $this->getConfig(self::$pluginInstance)->get('slack-regex-subject-ignore');
-        // Filter on subject, and validate regex:
         if ($regex_subject_ignore && preg_match("/$regex_subject_ignore/i", $ticket->getSubject())) {
-            $ost->logDebug('Ignored Message', 'Slack notification was not sent because the subject (' . $ticket->getSubject() . ') matched regex (' . htmlspecialchars($regex_subject_ignore) . ').');
             return;
         }
 
-        $heading = $this->format_text($heading);
+        $payload = [];
 
-        // Pull template from config, and use that. 
-        $template          = $this->getConfig(self::$pluginInstance)->get('message-template');
-        // Add our custom var
-        $custom_vars       = [
-            'slack_safe_message' => $this->format_text($body),
-        ];
-        $formatted_message = $ticket->replaceVars($template, $custom_vars);
+        if ($messageType === 'closed') {
+            // Formato simplificado para tickets cerrados
+            $status_name = $ticket->getStatus()->getName();
+            $payload['attachments'][0] = [
+                'color'       => $colour,
+                'fallback'    => sprintf('Ticket #%s  %s', $ticket->getNumber(), $ticket->getSubject()),
+                'title'       => sprintf('#%s: %s', $ticket->getNumber(), $ticket->getSubject()),
+                'title_link'  => $cfg->getUrl() . 'scp/tickets.php?id=' . $ticket->getId(),
+                'text'        => sprintf('Estado: *%s*', $status_name),
+                'ts'          => time(),
+                'footer'      => 'via osTicket Slack Plugin',
+            ];
+        } else {
+            // Formato completo para todas las demás notificaciones
+            $heading = $this->format_text($heading);
+            $template = $this->getConfig(self::$pluginInstance)->get('message-template');
+            $custom_vars = ['slack_safe_message' => $this->format_text($body)];
+            $formatted_message = $ticket->replaceVars($template, $custom_vars);
 
-        // Formato del mensaje para Slack.
-        $payload['attachments'][0] = [
-            'pretext'     => $heading,
-            'fallback'    => $heading,
-            'color'       => $colour,
-            'author'      => $ticket->getOwner(),
-            'title'       => $ticket->getSubject(),
-            'title_link'  => $cfg->getUrl() . 'scp/tickets.php?id=' . $ticket->getId(),
-            'ts'          => time(),
-            'footer'      => 'via osTicket Slack Plugin',
-            'footer_icon' => 'https://platform.slack-edge.com/img/default_application_icon.png',
-            'text'        => $formatted_message,
-            'mrkdwn_in'   => ["text"]
-        ];
-
-        // Add a field for tasks if there are open ones
-        if ($ticket->getNumOpenTasks()) {
-            $payload['attachments'][0]['fields'][] = [
-                'title' => __('Open Tasks'),
-                'value' => $ticket->getNumOpenTasks(),
-                'short' => TRUE,
+            $payload['attachments'][0] = [
+                'pretext'     => $heading,
+                'fallback'    => $heading,
+                'color'       => $colour,
+                'author'      => $ticket->getOwner(),
+                'title'       => $ticket->getSubject(),
+                'title_link'  => $cfg->getUrl() . 'scp/tickets.php?id=' . $ticket->getId(),
+                'ts'          => time(),
+                'footer'      => 'via osTicket Slack Plugin',
+                'footer_icon' => 'https://platform.slack-edge.com/img/default_application_icon.png',
+                'text'        => $formatted_message,
+                'mrkdwn_in'   => ["text"]
             ];
         }
-        // Change the colour to Fuschia if ticket is overdue
+        // --- FIN: LÓGICA DE DOBLE FORMATO ---
+
         if ($ticket->isOverdue()) {
-            $payload['attachments'][0]['colour'] = '#ff00ff';
+            $payload['attachments'][0]['color'] = '#ff00ff';
         }
 
-        // Format the payload:
         $data_string = utf8_encode(json_encode($payload));
 
         try {
-            // Setup curl
-            $ch = curl_init($url);
+            $ch = curl_init($webhookUrl);
             curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
             curl_setopt($ch, CURLOPT_POSTFIELDS, $data_string);
             curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_HTTPHEADER, array(
-                'Content-Type: application/json',
-                'Content-Length: ' . strlen($data_string))
-            );
-
-            // Actually send the payload to slack:
-            if (curl_exec($ch) === false) {
-                throw new \Exception($url . ' - ' . curl_error($ch));
-            } else {
+            curl_setopt($ch, CURLOPT_HTTPHEADER, array('Content-Type: application/json', 'Content-Length: ' . strlen($data_string)));
+            
+            if (curl_exec($ch) === false) throw new \Exception($webhookUrl . ' - ' . curl_error($ch));
+            else {
                 $statusCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                if ($statusCode != '200') {
-                    throw new \Exception(
-                    'Error sending to: ' . $url
-                    . ' Http code: ' . $statusCode
-                    . ' curl-error: ' . curl_errno($ch));
-                }
+                if ($statusCode != '200') throw new \Exception('Error sending to: ' . $webhookUrl . ' Http code: ' . $statusCode);
             }
         } catch (\Exception $e) {
             $ost->logError('Slack posting issue!', $e->getMessage(), true);
-            error_log('Error posting to Slack. ' . $e->getMessage());
         } finally {
-            curl_close($ch);
+            if(isset($ch)) curl_close($ch);
         }
     }
 
-    /**
-     * Fetches a ticket from a ThreadEntry
-     *
-     * @param ThreadEntry $entry        	
-     * @return Ticket
-     */
     function getTicket(ThreadEntry $entry) {
-        $ticket_id = Thread::objects()->filter([
-                    'id' => $entry->getThreadId()
-                ])->values_flat('object_id')->first() [0];
-
-        // Force lookup rather than use cached data.. 
-        return Ticket::lookup(array(
-                    'ticket_id' => $ticket_id
-        ));
+        $ticket_id = Thread::objects()->filter(['id' => $entry->getThreadId()])->values_flat('object_id')->first()[0];
+        return Ticket::lookup(['ticket_id' => $ticket_id]);
     }
 
-    /**
-     * Formats text according to the 
-     * formatting rules:https://api.slack.com/docs/message-formatting
-     * 
-     * @param string $text
-     * @return string
-     */
     function format_text($text) {
-        $formatter      = [
-            '<' => '&lt;',
-            '>' => '&gt;',
-            '&' => '&amp;'
-        ];
+        $formatter = ['<' => '&lt;', '>' => '&gt;', '&' => '&amp;'];
         $formatted_text = str_replace(array_keys($formatter), array_values($formatter), $text);
-        // put the <>'s control characters back in
-        $moreformatter  = [
-            'CONTROLSTART' => '<',
-            'CONTROLEND'   => '>'
-        ];
-        // Replace the CONTROL characters, and limit text length to 500 characters.
+        $moreformatter = ['CONTROLSTART' => '<', 'CONTROLEND' => '>'];
         return mb_substr(str_replace(array_keys($moreformatter), array_values($moreformatter), $formatted_text), 0, 500);
     }
 
-    /**
-     * Get either a Gravatar URL or complete image tag for a specified email address.
-     *
-     * @param string $email The email address
-     * @param string $s Size in pixels, defaults to 80px [ 1 - 2048 ]
-     * @param string $d Default imageset to use [ 404 | mm | identicon | monsterid | wavatar ]
-     * @param string $r Maximum rating (inclusive) [ g | pg | r | x ]
-     * @param boole $img True to return a complete IMG tag False for just the URL
-     * @param array $atts Optional, additional key/value attributes to include in the IMG tag
-     * @return String containing either just a URL or a complete image tag
-     * @source https://gravatar.com/site/implement/images/php/
-     */
     function get_gravatar($email, $s = 80, $d = 'mm', $r = 'g', $img = false, $atts = array()) {
         $url = 'https://www.gravatar.com/avatar/';
         $url .= md5(strtolower(trim($email)));
@@ -445,5 +300,4 @@ class SlackPlugin extends Plugin {
         }
         return $url;
     }
-
 }
